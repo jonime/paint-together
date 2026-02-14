@@ -40,6 +40,8 @@ export function Canvas({
   const currentStroke = useRef<Stroke | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
   const allStrokes = useRef<Stroke[]>([])
+  const myIdRef = useRef(crypto.randomUUID())
+  const hasSyncedRef = useRef(false)
   const [isConnected, setIsConnected] = useState(false)
 
   // Draw a single stroke on the canvas
@@ -135,7 +137,7 @@ export function Canvas({
 
     const channel = supabase.channel(CHANNEL_NAME, {
       config: {
-        presence: { key: crypto.randomUUID() },
+        presence: { key: myIdRef.current },
         broadcast: { self: false },
       },
     })
@@ -181,6 +183,71 @@ export function Canvas({
         ctx.stroke()
         ctx.restore()
       })
+      .on("broadcast", { event: "sync-request" }, ({ payload }) => {
+        // Another user is requesting the current canvas state
+        const requesterId = payload?.requesterId
+        if (requesterId === myIdRef.current) return // ignore own request
+
+        const canvas = canvasRef.current
+        if (!canvas) return
+
+        // Only respond if we have content (strokes drawn)
+        if (allStrokes.current.length === 0) return
+
+        // Add a small random delay so not everyone responds at once
+        const delay = Math.random() * 300
+        setTimeout(() => {
+          try {
+            const dataUrl = canvas.toDataURL("image/png")
+            const strokes = allStrokes.current
+            channelRef.current?.send({
+              type: "broadcast",
+              event: "sync-response",
+              payload: {
+                targetId: requesterId,
+                imageData: dataUrl,
+                strokes,
+              },
+            })
+          } catch {
+            // Canvas might be tainted or too large, ignore
+          }
+        }, delay)
+      })
+      .on("broadcast", { event: "sync-response" }, ({ payload }) => {
+        // We received a canvas snapshot from an existing user
+        const { targetId, imageData, strokes } = payload as {
+          targetId: string
+          imageData: string
+          strokes: Stroke[]
+        }
+
+        // Only accept if meant for us and we haven't synced yet
+        if (targetId !== myIdRef.current || hasSyncedRef.current) return
+        hasSyncedRef.current = true
+
+        const canvas = canvasRef.current
+        if (!canvas) return
+        const ctx = canvas.getContext("2d")
+        if (!ctx) return
+
+        // Load the image and draw it onto the canvas
+        const img = new Image()
+        img.crossOrigin = "anonymous"
+        img.onload = () => {
+          ctx.clearRect(0, 0, canvas.width, canvas.height)
+          ctx.save()
+          const dpr = window.devicePixelRatio || 1
+          ctx.scale(1 / dpr, 1 / dpr)
+          ctx.drawImage(img, 0, 0)
+          ctx.restore()
+          // Sync the stroke history so we can respond to future sync requests
+          if (strokes && strokes.length > 0) {
+            allStrokes.current = [...strokes]
+          }
+        }
+        img.src = imageData
+      })
       .on("broadcast", { event: "clear" }, () => {
         allStrokes.current = []
         const canvas = canvasRef.current
@@ -197,6 +264,17 @@ export function Canvas({
         if (status === "SUBSCRIBED") {
           setIsConnected(true)
           await channel.track({ online_at: new Date().toISOString() })
+
+          // Request canvas state from existing users
+          setTimeout(() => {
+            if (!hasSyncedRef.current) {
+              channel.send({
+                type: "broadcast",
+                event: "sync-request",
+                payload: { requesterId: myIdRef.current },
+              })
+            }
+          }, 500)
         }
       })
 
